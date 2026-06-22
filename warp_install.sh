@@ -202,7 +202,7 @@ PersistentKeepalive = 15\
 ' "$CONF"
 
 # Расширенная рандомизация (Обход ТСПУ/DPI)
-RAND_SUBNET=$(shuf -e "162.159.192" "162.159.193" "188.114.96" "188.114.97" -n 1)
+RAND_SUBNET=$(shuf -e "188.114.96" "188.114.97" -n 1)
 RAND_HOST=$(shuf -i 1-254 -n 1)
 RAND_PORT=$(shuf -e 2408 500 4500 1701 -n 1)
 sed -i "s/^Endpoint = .*/Endpoint = ${RAND_SUBNET}.${RAND_HOST}:${RAND_PORT}/" "$CONF"
