@@ -189,11 +189,11 @@ sed -i '/AllowedIPs = ::\/0/d' "$CONF"
 # Жестко инжектим правила В СЕКЦИЮ [Interface]
 sed -i '/^\[Interface\]/a\
 MTU = 1280\
-Table = off\
-PostUp = iptables -t mangle -A OUTPUT -o warp -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true\
-PostUp = iptables -t mangle -A FORWARD -o warp -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true\
-PostDown = iptables -t mangle -D OUTPUT -o warp -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true\
-PostDown = iptables -t mangle -D FORWARD -o warp -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true\
+Table = 51820\
+PostUp = ip rule add fwmark 255 table 51820 || true\
+PostDown = ip rule del fwmark 255 table 51820 || true\
+PostUp = iptables -t mangle -A POSTROUTING -o warp -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240 || true\
+PostDown = iptables -t mangle -D POSTROUTING -o warp -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240 || true\
 ' "$CONF"
 
 # Жестко инжектим Keepalive В СЕКЦИЮ [Peer]
@@ -201,10 +201,11 @@ sed -i '/^\[Peer\]/a\
 PersistentKeepalive = 15\
 ' "$CONF"
 
-# Рандомизация IP из пула Cloudflare ASN
-RAND_SUBNET=$(shuf -e 192 193 195 -n 1)
+# Расширенная рандомизация (Обход ТСПУ/DPI)
+RAND_SUBNET=$(shuf -e "162.159.192" "162.159.193" "162.159.195" "188.114.96" "188.114.97" -n 1)
 RAND_HOST=$(shuf -i 1-254 -n 1)
-sed -i "s/^Endpoint = .*/Endpoint = 162.159.${RAND_SUBNET}.${RAND_HOST}:2408/" "$CONF"
+RAND_PORT=$(shuf -e 2408 500 4500 1701 -n 1)
+sed -i "s/^Endpoint = .*/Endpoint = ${RAND_SUBNET}.${RAND_HOST}:${RAND_PORT}/" "$CONF"
 
 mkdir -p /etc/wireguard
 mv "$CONF" /etc/wireguard/warp.conf
@@ -251,18 +252,20 @@ age=$(( now - hs_ts ))
 
 ping_ok=0
 for ip in 1.1.1.1 8.8.8.8 9.9.9.9; do
-    if ping -I warp -c 1 -W 2 $ip &>/dev/null; then
+    # Пингуем через маркировку пакетов (так же, как ходит Xray)
+    if ping -m 255 -c 1 -W 2 $ip &>/dev/null; then
         ping_ok=1
         break
     fi
 done
 
 if [[ -z "$hs_ts" || "$hs_ts" -eq 0 || $age -gt 180 ]] || [[ $ping_ok -eq 0 ]]; then
-    RAND_SUBNET=$(shuf -e 192 193 195 -n 1)
+    RAND_SUBNET=$(shuf -e "162.159.192" "162.159.193" "162.159.195" "188.114.96" "188.114.97" -n 1)
     RAND_HOST=$(shuf -i 1-254 -n 1)
-    sed -i "s/^Endpoint = .*/Endpoint = 162.159.${RAND_SUBNET}.${RAND_HOST}:2408/" /etc/wireguard/warp.conf
+    RAND_PORT=$(shuf -e 2408 500 4500 1701 -n 1)
+    sed -i "s/^Endpoint = .*/Endpoint = ${RAND_SUBNET}.${RAND_HOST}:${RAND_PORT}/" /etc/wireguard/warp.conf
     systemctl restart wg-quick@warp
-    echo "WARP Watchdog: Connection lost. Rotated to 162.159.${RAND_SUBNET}.${RAND_HOST}:2408"
+    echo "WARP Watchdog: Connection lost. Rotated to ${RAND_SUBNET}.${RAND_HOST}:${RAND_PORT}"
 fi
 EOF
 chmod 700 "$APP_DIR/watchdog.sh"
