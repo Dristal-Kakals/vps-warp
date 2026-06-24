@@ -22,6 +22,34 @@ function done_() { echo -e "  ${C_GRN}✔${C_RST} ${C_GRY}$1${C_RST}"; }
 function fail()  { echo -e "\n  ${C_RED}✖ Error:${C_RST} $1\n"; exit 1; }
 function warn()  { echo -e "  ${C_YLW}⚠${C_RST} ${C_YLW}$1${C_RST}"; }
 
+# --- Endpoint pool (Cloudflare WARP) ---
+WARP_SUBNETS=(162.159.192 162.159.193 162.159.195 188.114.96 188.114.97 188.114.98 188.114.99)
+WARP_PORTS=(2408 500 4500 1701)
+ENDPOINT_CACHE="/etc/wireguard/warp-endpoints.txt"
+
+# Probe a random sample of WARP IPs with ICMP, sort by RTT, cache the top-5
+# "IP:PORT" (fastest first) into $ENDPOINT_CACHE. Echoes the single fastest
+# "IP:PORT", or nothing if no candidate answered (caller falls back to random).
+function scan_endpoints() {
+    local tmp sub h ip
+    tmp=$(mktemp) || return 1
+    for sub in "${WARP_SUBNETS[@]}"; do
+        for h in $(shuf -i 1-254 -n 6); do
+            ip="$sub.$h"
+            ( rtt=$(ping -c 1 -W 1 "$ip" 2>/dev/null | grep -oP 'time=\K[0-9.]+'); [[ -n "$rtt" ]] && echo "$rtt $ip" >> "$tmp" ) &
+        done
+    done
+    wait
+    [[ -s "$tmp" ]] || { rm -f "$tmp"; return 1; }
+    mkdir -p "$(dirname "$ENDPOINT_CACHE")"
+    sort -n "$tmp" | head -5 | while read -r _rtt ip; do
+        echo "${ip}:${WARP_PORTS[$RANDOM % ${#WARP_PORTS[@]}]}"
+    done > "$ENDPOINT_CACHE"
+    rm -f "$tmp"
+    chmod 600 "$ENDPOINT_CACHE"
+    head -1 "$ENDPOINT_CACHE"
+}
+
 function print_logo() {
     clear
     echo -e "${C_CYN}"
@@ -65,6 +93,9 @@ function t() {
             "wgcf_ok") echo "Ядро установлено" ;;
             "reg") echo "Регистрация в сети Cloudflare..." ;;
             "reg_ok") echo "Профиль готов" ;;
+            "scan") echo "Поиск самого быстрого эндпоинта Cloudflare..." ;;
+            "scan_ok") echo "Лучший эндпоинт выбран:" ;;
+            "scan_fail") echo "Эндпоинты не ответили на ping, берём случайный." ;;
             "plus_ask") echo "🔑 Введите ключ WARP+ (или нажмите Enter для бесплатной версии):" ;;
             "plus_apply") echo "Активация WARP+..." ;;
             "plus_ok") echo "Лицензия активирована!" ;;
@@ -92,6 +123,9 @@ function t() {
             "wgcf_ok") echo "Core installed" ;;
             "reg") echo "Registering Cloudflare account..." ;;
             "reg_ok") echo "Profile ready" ;;
+            "scan") echo "Probing for the fastest Cloudflare endpoint..." ;;
+            "scan_ok") echo "Best endpoint selected:" ;;
+            "scan_fail") echo "No endpoints answered ping, falling back to random." ;;
             "plus_ask") echo "🔑 Enter WARP+ key (or press Enter for free tier):" ;;
             "plus_apply") echo "Activating WARP+..." ;;
             "plus_ok") echo "License activated!" ;;
@@ -213,11 +247,16 @@ sed -i '/^\[Peer\]/a\
 PersistentKeepalive = 15\
 ' "$CONF"
 
-# Расширенная рандомизация (Обход ТСПУ/DPI)
-RAND_SUBNET=$(shuf -e "188.114.96" "188.114.97" -n 1)
-RAND_HOST=$(shuf -i 1-254 -n 1)
-RAND_PORT=$(shuf -e 2408 500 4500 1701 -n 1)
-sed -i "s/^Endpoint = .*/Endpoint = ${RAND_SUBNET}.${RAND_HOST}:${RAND_PORT}/" "$CONF"
+# Fastest-endpoint selection: ICMP-probe the WARP pool, cache top-5, pick #1.
+# Falls back to a random endpoint if nothing answered (blocked ICMP / DPI).
+step "📡 $(t "scan")"
+BEST_EP=$(scan_endpoints)
+if [[ -z "$BEST_EP" ]]; then
+    warn "$(t "scan_fail")"
+    BEST_EP="$(shuf -e 188.114.96 188.114.97 -n 1).$(shuf -i 1-254 -n 1):$(shuf -e 2408 500 4500 1701 -n 1)"
+fi
+sed -i "s/^Endpoint = .*/Endpoint = ${BEST_EP}/" "$CONF"
+done_ "$(t "scan_ok") ${BEST_EP}"
 
 mkdir -p /etc/wireguard
 mv "$CONF" /etc/wireguard/warp.conf
@@ -272,12 +311,28 @@ for ip in 1.1.1.1 8.8.8.8 9.9.9.9; do
 done
 
 if [[ -z "$hs_ts" || "$hs_ts" -eq 0 || $age -gt 180 ]] || [[ $ping_ok -eq 0 ]]; then
-    RAND_SUBNET=$(shuf -e "188.114.96" "188.114.97" -n 1)
-    RAND_HOST=$(shuf -i 1-254 -n 1)
-    RAND_PORT=$(shuf -e 2408 500 4500 1701 -n 1)
-    sed -i "s/^Endpoint = .*/Endpoint = ${RAND_SUBNET}.${RAND_HOST}:${RAND_PORT}/" /etc/wireguard/warp.conf
+    CACHE="/etc/wireguard/warp-endpoints.txt"
+    NEXT_EP=""
+    # Rotate to the next-fastest endpoint from the cached top-N (round-robin).
+    if [[ -s "$CACHE" ]]; then
+        cur=$(grep '^Endpoint' /etc/wireguard/warp.conf 2>/dev/null | awk '{print $3}')
+        mapfile -t eps < "$CACHE"
+        idx=-1
+        for i in "${!eps[@]}"; do
+            [[ "${eps[$i]}" == "$cur" ]] && { idx=$i; break; }
+        done
+        NEXT_EP="${eps[$(( (idx + 1) % ${#eps[@]} ))]}"
+    fi
+    # Fallback to a random endpoint if the cache is missing/empty.
+    if [[ -z "$NEXT_EP" ]]; then
+        RAND_SUBNET=$(shuf -e "188.114.96" "188.114.97" -n 1)
+        RAND_HOST=$(shuf -i 1-254 -n 1)
+        RAND_PORT=$(shuf -e 2408 500 4500 1701 -n 1)
+        NEXT_EP="${RAND_SUBNET}.${RAND_HOST}:${RAND_PORT}"
+    fi
+    sed -i "s/^Endpoint = .*/Endpoint = ${NEXT_EP}/" /etc/wireguard/warp.conf
     systemctl restart wg-quick@warp
-    echo "WARP Watchdog: Connection lost. Rotated to ${RAND_SUBNET}.${RAND_HOST}:${RAND_PORT}"
+    echo "WARP Watchdog: Connection lost. Rotated to ${NEXT_EP}"
 fi
 EOF
 chmod 700 "$APP_DIR/watchdog.sh"
