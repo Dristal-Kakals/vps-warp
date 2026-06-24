@@ -133,14 +133,26 @@ apt-get install -y wireguard iptables iproute2 curl wget &>/dev/null || fail "AP
 done_ "$(t "deps_ok")"
 
 # 3. WGCF Download
+# Security: pinned version + hardcoded SHA-256 to block supply-chain RCE.
+# wgcf runs as root, so never trust "latest" or an unverified download.
+# Update both version and checksums together from the release's checksums.txt.
+WGCF_VERSION="v2.2.31"
+WGCF_SHA256_amd64="69147e1a517c66129edd8ac8cb60484d6c9515178d7b4a2f95e3c925f225572a"
+WGCF_SHA256_arm64="b9bdbdeaa3f9f4ba741ba55b8bd94c24f7166c27668eb7e8192ccf9746961182"
+
 step "⚙️  $(t "wgcf")"
-LATEST_URL=$(curl -Ls -w "%{url_effective}" -o /dev/null "https://github.com/ViRb3/wgcf/releases/latest")
-WGCF_VERSION=$(basename "$LATEST_URL")
 ARCH=$(uname -m)
 [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]] && WGCF_ARCH="arm64" || WGCF_ARCH="amd64"
+WGCF_SHA256_VAR="WGCF_SHA256_${WGCF_ARCH}"
+WGCF_SHA256="${!WGCF_SHA256_VAR}"
 WGCF_DL="https://github.com/ViRb3/wgcf/releases/download/${WGCF_VERSION}/wgcf_${WGCF_VERSION#v}_linux_${WGCF_ARCH}"
-curl -sL "$WGCF_DL" -o /usr/local/bin/wgcf || fail "Download failed"
-chmod +x /usr/local/bin/wgcf
+
+# -f: fail on HTTP errors so a 404/5xx HTML page never lands as an executable.
+WGCF_TMP=$(mktemp) || fail "mktemp failed"
+curl -fSL "$WGCF_DL" -o "$WGCF_TMP" || { rm -f "$WGCF_TMP"; fail "Download failed"; }
+echo "${WGCF_SHA256}  ${WGCF_TMP}" | sha256sum -c - &>/dev/null || { rm -f "$WGCF_TMP"; fail "Checksum mismatch — aborting (possible tampering)"; }
+install -m 0755 "$WGCF_TMP" /usr/local/bin/wgcf || { rm -f "$WGCF_TMP"; fail "Install failed"; }
+rm -f "$WGCF_TMP"
 done_ "$(t "wgcf_ok") (v${WGCF_VERSION#v})"
 
 # 4. Registration (Protected from Rate Limits)
